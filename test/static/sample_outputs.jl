@@ -30,7 +30,7 @@ sample_llm_outputs = [
         "(x1 + x2) / x3 * (x4 ^ x5)"
     """,
 
-    # Incorrect formatting (recovery possible)
+    # Valid JSON with an unsupported nested value
     """{
         "equations": [
             "x1 / x2",
@@ -55,7 +55,8 @@ sample_parsed_outputs = [
     ["x1 / x2", "x1 ^ x2", "(x1 + x2) / x3 * (x4 ^ x5)"],
     String[],
     String[],
-    ["x1 / x2", "x1 ^ x2", "(x1 + x2) / x3 * (x4 ^ x5)"],
+    # NSYM_SAFE_JSON_ONLY: Do not recover nested data by evaluating it as Julia code.
+    String[],
     String[],
 ]
 

@@ -43,7 +43,7 @@ using PromptingTools:
     CustomOpenAISchema,
     OllamaSchema,
     OpenAISchema
-using JSON: parse
+import JSON
 using UUIDs: uuid1
 
 @unstable function llm_randomize_tree(
@@ -285,38 +285,23 @@ end
 end
 
 function parse_msg_content(msg_content::String, options::AbstractOptions)::Vector{String}
-    # Attempt extraction with several patterns in order
-    patterns = [r"```json(.*?)```"s, r"```(.*?)```"s, r"(\[.*?\])"s]
-
-    content = nothing
-    for pat in patterns
-        content = try_capture(pat, msg_content)
-        content !== nothing && break
-    end
-
+    # NSYM_SAFE_JSON_ONLY: Local nsym change; treat all LLM output as data, never Julia code.
+    content = try_capture(r"```json\s*(.*?)```"is, msg_content)
     content = content === nothing ? msg_content : content
 
     out = nothing
     try
-        out = parse(content)
+        out = JSON.parse(content)
     catch
         if options.verbose
             @debug "Failed to parse content: $content"
         end
     end
 
-    try
-        out = eval(Meta.parse(msg_content))
-    catch
-        if options.verbose
-            @debug "Failed to eval content: $content"
-        end
-    end
-
     if out isa Dict && all(x -> isa(x, String), values(out))
-        return collect(values(out))
+        return String[value for value in values(out)]
     elseif out isa Vector && all(x -> isa(x, String), out)
-        return out
+        return String[value for value in out]
     end
     return String[]
 end
