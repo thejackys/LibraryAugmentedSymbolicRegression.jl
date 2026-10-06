@@ -46,6 +46,31 @@ using PromptingTools:
 import JSON
 using UUIDs: uuid1
 
+function _parse_llm_tree(
+    ::Type{T}, text::AbstractString, options::AbstractOptions
+)::Union{AbstractExpressionNode{T},Nothing} where {T<:DATA_TYPE}
+    text = String(strip(text, [' ', '\n', '"', ',', '.', '[', ']']))
+    tree = try
+        # The parser's assignment helper accepts Expr only. Use assignment
+        # syntax for a bare variable or number. This does not evaluate code.
+        ast = Meta.parse(text)
+        if ast isa Symbol || ast isa Number
+            text = "y = " * text
+        end
+        get_contents(parse_expr(T, text, options))
+    catch e
+        e isa InterruptException && rethrow()
+        options.verbose && @debug "Failed to parse an LLM expression" exception = e
+        return nothing
+    end
+    # Other node types can have undefined constant/value fields. Check the
+    # degree first, then the constant flag, then the parser's sentinel value.
+    if tree.degree == 0 && tree.constant && tree.val == 1
+        return nothing
+    end
+    return tree
+end
+
 @unstable function llm_randomize_tree(
     ex::AbstractExpression,
     curmaxsize::Int,
@@ -62,19 +87,29 @@ using UUIDs: uuid1
 end
 
 @unstable function llm_randomize_tree(
-    ::AbstractExpressionNode{T},
+    tree::AbstractExpressionNode{T},
     curmaxsize::Int,
     options::AbstractOptions,
     nfeatures::Int,
     rng::AbstractRNG=default_rng(),
 ) where {T<:DATA_TYPE}
     tree_size_to_generate = rand(rng, 1:curmaxsize)
-    return _gen_llm_random_tree(tree_size_to_generate, options, nfeatures, T)
+    return _gen_llm_random_tree(
+        tree_size_to_generate, options, nfeatures, T; fallback_tree=tree
+    )
 end
 
 function _gen_llm_random_tree(
-    node_count::Int, options::AbstractOptions, nfeatures::Int, ::Type{T}
+    node_count::Int,
+    options::AbstractOptions,
+    nfeatures::Int,
+    ::Type{T};
+    fallback_tree::Union{AbstractExpressionNode{T},Nothing}=nothing,
 )::AbstractExpressionNode{T} where {T<:DATA_TYPE}
+    # Keep the input node when no valid LLM expression is available. Direct
+    # generation without an input node still uses the random-tree fallback.
+    fallback() = isnothing(fallback_tree) ?
+        gen_random_tree_fixed_size(node_count, options, nfeatures, T) : fallback_tree
     if isnothing(options.idea_database)
         assumptions = []
     else
@@ -142,7 +177,7 @@ function _gen_llm_random_tree(
         log_generation!(
             options.lasr_logger; id=gen_id, mode="gen_random", failed="None." * string(e)
         )
-        return gen_random_tree_fixed_size(node_count, options, nfeatures, T)
+        return fallback()
     end
 
     log_generation!(
@@ -155,17 +190,13 @@ function _gen_llm_random_tree(
 
     if N == 0
         log_generation!(options.lasr_logger; id=gen_id, mode="gen_random", failed="None")
-        return gen_random_tree_fixed_size(node_count, options, nfeatures, T)
+        return fallback()
     end
 
     for i in 1:N
         l = rand(1:N)
-        t = parse_expr(
-            T,
-            String(strip(gen_tree_options[l], [' ', '\n', '"', ',', '.', '[', ']'])),
-            options,
-        )
-        if t.val == 1 && t.constant
+        t = _parse_llm_tree(T, gen_tree_options[l], options)
+        if isnothing(t)
             continue
         end
         log_generation!(
@@ -177,16 +208,13 @@ function _gen_llm_random_tree(
         return t
     end
 
-    out = parse_expr(
-        T, String(strip(gen_tree_options[1], [' ', '\n', '"', ',', '.', '[', ']'])), options
-    )
+    out = _parse_llm_tree(T, gen_tree_options[1], options)
+    if isnothing(out)
+        return fallback()
+    end
     log_generation!(
         options.lasr_logger; id=gen_id, mode="gen_random", chosen=render_expr(out, options)
     )
-
-    if out.val == 1 && out.constant
-        return gen_random_tree_fixed_size(node_count, options, nfeatures, T)
-    end
 
     return out
 end
@@ -505,12 +533,8 @@ function llm_mutate_tree(
 
     for i in 1:N
         l = rand(1:N)
-        t = parse_expr(
-            T,
-            String(strip(mut_tree_options[l], [' ', '\n', '"', ',', '.', '[', ']'])),
-            options,
-        )
-        if t.val == 1 && t.constant
+        t = _parse_llm_tree(T, mut_tree_options[l], options)
+        if isnothing(t)
             continue
         end
 
@@ -520,9 +544,8 @@ function llm_mutate_tree(
         return t
     end
 
-    out = parse_expr(
-        T, String(strip(mut_tree_options[1], [' ', '\n', '"', ',', '.', '[', ']'])), options
-    )
+    out = _parse_llm_tree(T, mut_tree_options[1], options)
+    isnothing(out) && return tree
 
     log_generation!(
         options.lasr_logger; id=gen_id, mode="mutate", chosen=render_expr(out, options)
@@ -642,11 +665,8 @@ function llm_crossover_trees(
     end
 
     if N == 1
-        t = parse_expr(
-            T,
-            String(strip(cross_tree_options[1], [' ', '\n', '"', ',', '.', '[', ']'])),
-            options,
-        )
+        t = _parse_llm_tree(T, cross_tree_options[1], options)
+        isnothing(t) && return tree1, tree2
 
         log_generation!(
             options.lasr_logger; id=gen_id, mode="crossover", chosen=render_expr(t, options)
@@ -656,12 +676,8 @@ function llm_crossover_trees(
 
     for i in 1:(2 * N)
         l = rand(1:N)
-        t = parse_expr(
-            T,
-            String(strip(cross_tree_options[l], [' ', '\n', '"', ',', '.', '[', ']'])),
-            options,
-        )
-        if t.val == 1 && t.constant
+        t = _parse_llm_tree(T, cross_tree_options[l], options)
+        if isnothing(t)
             continue
         end
 
@@ -674,19 +690,11 @@ function llm_crossover_trees(
     end
 
     if isnothing(cross_tree1)
-        cross_tree1 = parse_expr(
-            T,
-            String(strip(cross_tree_options[1], [' ', '\n', '"', ',', '.', '[', ']'])),
-            options,
-        )
+        cross_tree1 = something(_parse_llm_tree(T, cross_tree_options[1], options), tree1)
     end
 
     if isnothing(cross_tree2)
-        cross_tree2 = parse_expr(
-            T,
-            String(strip(cross_tree_options[2], [' ', '\n', '"', ',', '.', '[', ']'])),
-            options,
-        )
+        cross_tree2 = something(_parse_llm_tree(T, cross_tree_options[2], options), tree2)
     end
 
     recording_str =
